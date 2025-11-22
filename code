@@ -1,0 +1,278 @@
+
+
+"""
+rare_event_pipeline.py
+Extremely Rare Events in High-Dimensional Spaces
+Stable pipeline using:
+- Contrastive encoder (LayerNorm)
+- Robust covariance estimator (Ledoit-Wolf)
+- Mahalanobis anomaly score
+- EVT tail calibration (GPD)
+"""
+
+pip install numpy pandas scikit-learn scipy torch tqdm
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.covariance import LedoitWolf
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
+from scipy import stats
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
+import warnings
+warnings.filterwarnings("ignore")
+
+SEED = 0
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = "cpu"  # change to cuda if available
+
+# ------------------------------------------------------
+# Synthetic High-Dim Data
+# ------------------------------------------------------
+def make_synthetic_highdim(n_normal=8000, n_anom=120, dim=256, seed=42):
+    rng = np.random.RandomState(seed)
+    centers = rng.randn(5, dim) * 5.0
+    normal = []
+    for i in range(n_normal):
+        c = centers[rng.randint(0, 5)]
+        x = c + 0.5 * rng.randn(dim)
+        normal.append(x)
+    normal = np.vstack(normal).astype(np.float32)
+
+    anom = (rng.standard_t(df=2, size=(n_anom, dim)).astype(np.float32) * 3.0 +
+            rng.randn(n_anom, dim).astype(np.float32) * 20.0)
+    return normal, anom
+
+# ------------------------------------------------------
+# Augmentations (robust)
+# ------------------------------------------------------
+def augment_vector(x, noise_scale=0.02, drop_prob=0.05):
+    x = x.copy().astype(np.float32)
+
+    x += np.random.normal(scale=noise_scale, size=x.shape).astype(np.float32)
+
+    mask = (np.random.rand(*x.shape) > drop_prob).astype(np.float32)
+    if mask.sum() == 0:
+        mask[np.random.randint(0, len(mask))] = 1.0
+    x *= mask
+
+    jitter = 1.0 + np.random.normal(scale=noise_scale/2, size=x.shape).astype(np.float32)
+    x *= jitter
+
+    return np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
+class VectorPairsDataset(Dataset):
+    def __init__(self, X, augment_fn):
+        self.X = X.astype(np.float32)
+        self.augment_fn = augment_fn
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        x = self.X[idx]
+        v1 = self.augment_fn(x)
+        v2 = self.augment_fn(x)
+        return torch.from_numpy(v1), torch.from_numpy(v2)
+
+# ------------------------------------------------------
+# Encoder (LayerNorm → stable)
+# ------------------------------------------------------
+class MLPEncoder(nn.Module):
+    def __init__(self, input_dim, proj_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU()
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(256, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+
+    def forward(self, x):
+        h = self.net(x)
+        z = F.normalize(self.proj(h), dim=1)
+        return h, z
+
+# ------------------------------------------------------
+# NT-Xent Loss
+# ------------------------------------------------------
+def nt_xent_loss(z1, z2, temperature=0.2):
+    B = z1.shape[0]
+    z = torch.cat([z1, z2], dim=0)
+    sim = torch.matmul(z, z.T) / temperature
+
+    sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+    sim = sim - sim_max.detach()
+
+    exp_sim = torch.exp(sim)
+    mask = (~torch.eye(2*B, device=z.device).bool()).float()
+    exp_sim = exp_sim * mask
+
+    pos = torch.exp((z1*z2).sum(1)/temperature)
+    pos = torch.cat([pos, pos], dim=0)
+
+    denom = exp_sim.sum(1)
+    loss = -torch.log(pos / (denom + 1e-12))
+    return loss.mean()
+
+# ------------------------------------------------------
+# Train encoder
+# ------------------------------------------------------
+def train_encoder(X, proj_dim=64, epochs=10, batch_size=256):
+    ds = VectorPairsDataset(X, augment_vector)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
+
+    enc = MLPEncoder(X.shape[1], proj_dim).to(DEVICE)
+    opt = torch.optim.Adam(enc.parameters(), lr=1e-3)
+
+    for ep in range(epochs):
+        losses = []
+        for v1, v2 in dl:
+            v1, v2 = v1.to(DEVICE).float(), v2.to(DEVICE).float()
+            _, z1 = enc(v1)
+            _, z2 = enc(v2)
+            loss = nt_xent_loss(z1, z2)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+        print(f"Epoch {ep+1}/{epochs} — loss {np.mean(losses):.4f}")
+    return enc
+
+# ------------------------------------------------------
+# Robust Mahalanobis Model
+# ------------------------------------------------------
+def fit_mahalanobis(enc, X):
+    enc.eval()
+    with torch.no_grad():
+        H = enc(torch.from_numpy(X).to(DEVICE).float())[0].cpu().numpy()
+
+    H = np.nan_to_num(H, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    scaler = StandardScaler().fit(H)
+    Hs = scaler.transform(H)
+
+    lw = LedoitWolf().fit(Hs)   # shrinkage covariance
+    cov = lw.covariance_
+    mean = lw.location_
+
+    # precompute precision (invertible always with LedoitWolf)
+    prec = lw.precision_
+
+    return dict(mean=mean, prec=prec, scaler=scaler)
+
+def mahalanobis_scores(model, X_emb):
+    scm = model["scaler"]
+    mean = model["mean"]
+    prec = model["prec"]
+
+    Xs = scm.transform(X_emb)
+    diff = Xs - mean
+    # M-distance^2 = x^T Σ^{-1} x
+    md2 = np.sum(diff @ prec * diff, axis=1)
+    return md2
+
+# ------------------------------------------------------
+# EVT Calibration
+# ------------------------------------------------------
+def fit_evt(md2, tail_frac=0.001, min_tail=30):
+    thr = np.quantile(md2, 1 - max(tail_frac, min_tail/len(md2)))
+    excess = md2[md2 >= thr] - thr
+    if len(excess) < 10:
+        return thr, None
+    c, loc, scale = stats.genpareto.fit(excess, floc=0)
+    return thr, (c, scale)
+
+def evt_pvalue(v, thr, params):
+    if params is None:
+        return 1.0 if v >= thr else 0.0
+    c, scale = params
+    if v < thr:
+        return 0.0
+    return stats.genpareto.sf(v - thr, c, loc=0, scale=scale)
+
+# ------------------------------------------------------
+# End-to-end pipeline
+# ------------------------------------------------------
+def build_pipeline(normal):
+    print("Training encoder...")
+    enc = train_encoder(normal, epochs=12)
+
+    print("Extracting embeddings...")
+    enc.eval()
+    with torch.no_grad():
+        H = enc(torch.from_numpy(normal).float())[0].cpu().numpy()
+
+    print("Fitting robust Mahalanobis model...")
+    model = fit_mahalanobis(enc, normal)
+
+    print("Calibrating EVT tail...")
+    md2 = mahalanobis_scores(model, H)
+    thr, params = fit_evt(md2)
+    print("EVT threshold:", thr, "GPD params:", params)
+
+    return dict(encoder=enc, model=model, thr=thr, params=params)
+
+def score(pipeline, X):
+    enc = pipeline["encoder"]
+    model = pipeline["model"]
+    thr = pipeline["thr"]
+    params = pipeline["params"]
+
+    enc.eval()
+    with torch.no_grad():
+        H = enc(torch.from_numpy(X).float())[0].cpu().numpy()
+
+    H = np.nan_to_num(H, nan=0, posinf=1e6, neginf=-1e6)
+    md2 = mahalanobis_scores(model, H)
+    pvals = np.array([evt_pvalue(v, thr, params) for v in md2])
+
+    # composite score: normalized md2 + EVT penalty
+    z = (md2 - np.median(md2)) / (np.median(np.abs(md2 - np.median(md2))) + 1e-9)
+    tail_pen = -np.log(np.clip(pvals, 1e-12, 1.0))
+    score = z + 0.5 * tail_pen
+
+    return score, md2, pvals
+
+# ------------------------------------------------------
+# RUN DEMO
+# ------------------------------------------------------
+if __name__ == "__main__":
+    print("Generating synthetic data...")
+    normal, anom = make_synthetic_highdim()
+
+    idx = np.random.choice(len(normal), 5000, replace=False)
+    train_norm = normal[idx]
+
+    pipeline = build_pipeline(train_norm)
+
+    test_norm = normal[5000:5200]
+    Xtest = np.vstack([test_norm, anom])
+    ytrue = np.array([0]*len(test_norm) + [1]*len(anom))
+
+    scores, md2, pvals = score(pipeline, Xtest)
+
+    auc = roc_auc_score(ytrue, scores)
+    print("ROC-AUC:", auc)
+
+    k = max(1, len(scores)//100)
+    pred = np.zeros_like(scores)
+    pred[np.argsort(scores)[-k:]] = 1
+
+    p, r, f, _ = precision_recall_fscore_support(ytrue, pred, average='binary')
+    print(f"Precision@1%: {p:.3f} Recall@1%: {r:.3f} F1@1%: {f:.3f}")
+
+    print("Example EVT tail p-values:", pvals[-10:])
